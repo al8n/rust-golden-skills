@@ -164,20 +164,29 @@ name reads badly).
 
 ### Getters — `const` by default, **project the wrapper, never expose it**
 A getter returns the borrowed *view* of a field, not its concrete wrapper type.
-Never return `&Option<T>`, `&Vec<T>`, `&Box<[T]>`, `&Arc<[T]>`, `&String` — map
-each to its projection:
+Never return `&Option<T>`, `&Vec<T>`, `&Box<[T]>`, `&Arc<[T]>`, `&String`.
+
+**Getter naming** (matters — bake it in by construction):
+- `field() -> T` (bare name, by value) is **only** for `Copy` types.
+- A getter that returns a **`&T` borrow of a non-`Copy` value** is named
+  **`field_ref()`** — it pairs with `field_mut()` (shared vs exclusive borrow).
+- Projection views keep their own names: `field_slice() -> &[T]` for sequences,
+  and the canonical `field() -> &str` / `field() -> &[u8]` views for
+  string / byte fields (those don't return `-> T`, so they don't collide with
+  the `Copy`-only rule).
 
 | field type | read getter | mutable getter (§ mutable getters) |
 |---|---|---|
-| `T: Copy` | `-> T` (`self.f`) | `-> &mut T` (`&mut self.f`) |
-| `T` (non-`Copy`) | `-> &T` (`&self.f`) | `-> &mut T` |
-| `Option<T>` | `-> Option<&T>` (`self.f.as_ref()`) | `-> Option<&mut T>` (`self.f.as_mut()`) |
-| `Vec<T>` | `-> &[T]` (`as_slice`) — never `&Vec<T>` | `&mut [T]` + `&mut Vec<T>` — see **Growable owned containers** |
-| `Box<[T]>` | `-> &[T]` (`&self.f` / `.as_ref()`) | `-> &mut [T]` (`&mut self.f` / `.as_mut()`) — fixed length |
-| `Arc<[T]>` / `Rc<[T]>` | `-> &[T]` (`&self.f`) | **none** — shared/immutable |
-| `Arc<T>` / `Rc<T>` | `-> &T` (`&self.f`) | **none** — shared/immutable |
-| `String` / small-string | `-> &str` (`.as_str()`) — never `&String` | `-> &mut String` — see **Growable owned containers** |
-| `bytes::Bytes` | `-> &[u8]` (`.as_ref()`) + `_bytes() -> Bytes` clone | **none** — immutable |
+| `T: Copy` | `field() -> T` (`self.f`) | `field_mut() -> &mut T` (`&mut self.f`) |
+| `T` (non-`Copy`) | `field_ref() -> &T` (`&self.f`) | `field_mut() -> &mut T` |
+| `Option<T>`, `T: Copy` | `field() -> Option<T>` (`self.f`) | `field_mut() -> Option<&mut T>` (`as_mut`) |
+| `Option<T>`, non-`Copy` | `field_ref() -> Option<&T>` (`self.f.as_ref()`) | `field_mut() -> Option<&mut T>` (`as_mut`) |
+| `Vec<T>` | `field_slice() -> &[T]` (`as_slice`) — never `&Vec<T>` | `&mut [T]` + `&mut Vec<T>` — see **Growable owned containers** |
+| `Box<[T]>` | `field_slice() -> &[T]` (`&self.f` / `.as_ref()`) | `field_slice_mut() -> &mut [T]` — fixed length |
+| `Arc<[T]>` / `Rc<[T]>` | `field_slice() -> &[T]` (`&self.f`) | **none** — shared/immutable |
+| `Arc<T>` / `Rc<T>` | `field_ref() -> &T` (`&self.f`) | **none** — shared/immutable |
+| `String` / small-string | `field() -> &str` (`.as_str()`) — never `&String` | `&mut String` — see **Growable owned containers** |
+| `bytes::Bytes` | `field() -> &[u8]` (`.as_ref()`) + `field_bytes() -> Bytes` clone | **none** — immutable |
 
 `const`-ness (per §4): `Option::as_ref`/`as_mut`, `Vec::as_slice`, `Copy`
 returns, and `&self.field` / `&mut self.field` are `const`. Not `const`:
@@ -216,11 +225,12 @@ zero/empty value is itself meaningful and must be distinct from absent
 ### Mutable getters — for fields that accept in-place mutation
 If a field may be mutated in place (an owned collection a caller appends to, a
 nested struct a caller edits), expose a mutable getter alongside the read-only
-one, **projected the same way** as the read getter (see the table above):
+one, **projected and named the same way** (`field_ref` ↔ `field_mut`,
+`field_slice` ↔ `field_slice_mut`):
 ```rust
-pub const fn field_mut(&mut self) -> &mut T { &mut self.field }           // T
-pub const fn opt_mut(&mut self) -> Option<&mut T> { self.opt.as_mut() }   // Option<T>
-pub const fn buf_mut(&mut self) -> &mut [T] { self.buf.as_mut_slice() }   // Box<[T]> (fixed len)
+pub const fn field_mut(&mut self) -> &mut T { &mut self.field }                 // pairs with field_ref()
+pub const fn opt_mut(&mut self) -> Option<&mut T> { self.opt.as_mut() }         // Option<T>
+pub const fn buf_slice_mut(&mut self) -> &mut [T] { self.buf.as_mut_slice() }   // Box<[T]> (fixed len)
 // Vec<T> / String: use the slice-mut + structural-mut pair from
 // "Growable owned containers" (foo_slice_mut + foo_mut).
 ```
@@ -282,19 +292,21 @@ String/owned setters and builders take `impl Into<Field>` so callers pass
 `&str`/`String`/etc. without ceremony (this makes them non-const — that's fine).
 
 ### Inline cheap accessors — `#[inline(always)]`
-Every trivial accessor — `field()` getters, `field_mut()`, `with_*` builders,
-`set_*` setters, and zero/const constructors — is a one-liner that crosses the
-crate boundary, where the optimizer often won't inline it on its own (especially
-without LTO). Mark them `#[inline(always)]`:
+Every trivial accessor — `field()` / `field_ref()` getters, `field_mut()`,
+`with_*` builders, `set_*` setters, and zero/const constructors — is a one-liner
+that crosses the crate boundary, where the optimizer often won't inline it on its
+own (especially without LTO). Mark them `#[inline(always)]`:
 ```rust
 #[inline(always)]
-pub const fn id(&self) -> &Id { &self.id }
+pub const fn id(&self) -> Id { self.id }                 // Copy: by value, bare name
+#[inline(always)]
+pub const fn provenance_ref(&self) -> &Provenance { &self.provenance }  // non-Copy: &T, _ref name
 ```
 Crates that run a coverage tool which chokes on forced inlining gate it so
 coverage builds still see the function body:
 ```rust
 #[cfg_attr(not(tarpaulin), inline(always))]
-pub const fn id(&self) -> &Id { &self.id }
+pub const fn id(&self) -> Id { self.id }
 ```
 (Reserve `#[inline(always)]` for genuinely trivial bodies; non-trivial methods
 get plain `#[inline]` or nothing and let the optimizer decide.)
@@ -387,6 +399,8 @@ Verify across the matrix: `cargo hack test --each-feature` (or
 - [ ] Getters project the wrapper, never expose it: `Option<T>`→`Option<&T>`,
       `Vec<T>`/`Box<[T]>`/`Arc<[T]>`→`&[T]`, `String`→`&str`, `Bytes`→`&[u8]`.
       `const` unless a non-const op forbids it.
+- [ ] Getter naming: bare `field() -> T` **only** for `Copy` (by value); a `&T`
+      borrow is `field_ref()`; sequence views are `field_slice()`.
 - [ ] Mutable owned fields also expose a projected `*_mut`
       (`Option<&mut T>` / `&mut [T]` / `&mut T`), `const`, only where no
       invariant is bypassed; shared/immutable fields (`Arc`/`Rc`/`Bytes`) get
