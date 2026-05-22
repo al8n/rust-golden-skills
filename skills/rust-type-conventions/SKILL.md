@@ -1,6 +1,6 @@
 ---
 name: rust-type-conventions
-description: Golden rules for declaring Rust structs, enums, and their accessors (encapsulation, const fn, new()/Default delegation, variant predicates, thiserror, open Other(_)/coded Unknown(n) enums, no-module-name-stutter naming, no-std feature tiers). Use when writing or reviewing any struct/enum definition, getter, builder, setter, or error type in a Rust library.
+description: Golden rules for declaring Rust structs, enums, and their accessors (encapsulation, const fn, new()/Default delegation, variant predicates, thiserror, open Other(_)/coded Unknown(n) enums, no-module-name-stutter naming, no-std feature tiers, feature-gated optional trait impls grouped in an anonymous const block). Use when writing or reviewing any struct/enum definition, getter, builder, setter, or error type in a Rust library.
 ---
 
 # Rust type-declaration golden rules
@@ -385,6 +385,100 @@ Verify across the matrix: `cargo hack test --each-feature` (or
 
 ---
 
+## 8. Optional (feature-gated) trait impls — group in an anonymous `const` block
+
+§1 says an impl a type needs **unconditionally** is never feature-gated. The
+complement: when an impl genuinely **is** optional — a `serde` / `buffa` /
+`arbitrary` / … impl that should exist only with its feature — don't scatter
+`#[cfg(feature = "…")]` across the impl, its local imports, and any shadow/DTO
+helper. Wrap the whole group in one anonymous `const _: () = { … };` block,
+gated **once**:
+
+```rust
+#[cfg(feature = "serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+const _: () = {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    impl Serialize for Foo { /* … */ }
+
+    // `try_from` shadow + any helpers stay PRIVATE to this block —
+    // they never leak into the surrounding module's namespace.
+    #[derive(Deserialize)]
+    struct FooShadow { /* mirror the fields */ }
+
+    impl<'de> Deserialize<'de> for Foo {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            Foo::try_from(FooShadow::deserialize(d)?).map_err(serde::de::Error::custom)
+        }
+    }
+};
+```
+
+Why this is clean:
+- **One gate, not N.** The single `#[cfg]` covers the impls, the local `use`s,
+  *and* the private shadow/helper types together — instead of repeating it on
+  each item, and instead of a module-level `#[cfg(feature)] use …` that warns as
+  unused in builds without the feature.
+- **The impls still apply crate-wide.** A trait impl is registered globally no
+  matter where it is written; nesting it in an anonymous const does **not** hide
+  or scope it away. That is what makes the wrapper free.
+- **Helpers stay local.** *Named* items inside the block (the `FooShadow`
+  struct, helper fns) **are** scoped to the block — exactly right for the
+  private deserialize-shadow / DTO types (§ validate-on-deserialize) you don't
+  want polluting the module.
+
+Constraints:
+- **Only for optional impls.** An unconditional impl is written normally at
+  module level (§1) — don't wrap it.
+- **Nothing inside can be `pub`** / part of the public API: the block scopes
+  named items locally, so a public type belongs in its module, not here. Keep
+  the block to the impl(s) + their private helpers + local `use`s.
+- Keep the `#[cfg]` and the `doc(cfg)` predicate **identical**, and apply this
+  per feature (one block per optional feature an item implements).
+
+---
+
+## 9. serde representation — never emit `null`; make absence cheap
+
+When a type derives (or hand-writes) `serde`, two paired rules keep the wire
+form sparse, forward-compatible, and symmetric.
+
+### Never serialize `null` — `skip_serializing_if` every `Option`
+
+A `None` serializes to an **absent field**, never an explicit `null`. Every
+`Option<T>` serde field carries:
+
+```rust
+#[serde(skip_serializing_if = "Option::is_none")]
+foo: Option<T>,
+```
+
+An explicit `null` is pure noise — it costs bytes, and a reader cannot tell
+"deliberately null" from "the producer's default", so don't produce it. The
+same reasoning extends to any field whose wire/storage codec already elides a
+sentinel (an empty `String`/`Vec`, a zero-sentinel numeric): skip-serialize
+that sentinel too, so the Rust type and the wire form agree on "absent".
+
+### `serde(default)` whenever the field has a default
+
+If a field's type has a `Default` impl — or the field has a known default
+value — it **must** be `serde(default)`, so a payload that omits the field
+(because the producer skipped it per the rule above, or because the payload
+predates the field) still deserializes:
+
+- the whole struct has a meaningful `Default` → container-level
+  `#[serde(default)]`;
+- a single field → `#[serde(default)]` (uses the field type's `Default`) or
+  `#[serde(default = "path::to::default_fn")]` for a non-`Default` default.
+
+`skip_serializing_if` and `serde(default)` are a **pair**: the first drops the
+field when absent, the second restores it on the way back. One without the
+other is an asymmetric round-trip — a value that serializes to nothing and
+then fails to deserialize.
+
+---
+
 ## Review checklist (run against any struct/enum diff)
 
 - [ ] No public fields.
@@ -421,6 +515,14 @@ Verify across the matrix: `cargo hack test --each-feature` (or
       (`#[derive(Default)] + #[default]`).
 - [ ] Errors derived (`thiserror`/equivalent), `#[non_exhaustive]`,
       `core::error::Error` for no-std.
+- [ ] Optional (feature-gated) trait impls — `serde`/`buffa`/`arbitrary`/… —
+      grouped in one gated `const _: () = { … };` block (single `#[cfg]` +
+      `doc(cfg)`, private helpers/imports scoped inside), not scattered
+      per-item; unconditional impls stay un-gated at module level.
+- [ ] serde: every `Option` field is `#[serde(skip_serializing_if =
+      "Option::is_none")]` (never emit `null`); every field with a default
+      is `serde(default)` (container-level if the whole struct has a
+      meaningful `Default`, else per-field `default` / `default = "fn"`).
 - [ ] No module-name stutter; bare names don't shadow std.
 - [ ] Test matrix + fmt + clippy clean; out-of-tree name references updated if
       anything was renamed.
