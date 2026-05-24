@@ -1,6 +1,6 @@
 ---
 name: rust-type-conventions
-description: Golden rules for declaring Rust structs, enums, and their accessors (encapsulation, const fn, new()/Default delegation, variant predicates, thiserror, structured error variants with Cow/Box<dyn Error> escape hatches, open Other(_)/coded Unknown(n) enums, no-module-name-stutter naming, no-std feature tiers, method-local generic bounds, feature-gated optional trait impls grouped in an anonymous const block, serde representation rules). Use when writing or reviewing any struct/enum definition, getter, builder, setter, or error type in a Rust library.
+description: Golden rules for declaring Rust structs, enums, and their accessors (encapsulation, const fn, new()/Default delegation, variant predicates, thiserror, structured error variants with #[from] for typed foreign-error wrapping and Cow<'static, str> for unmodellable text (Box<dyn Error>/anyhow only in binaries), open Other(_)/coded Unknown(n) enums, no-module-name-stutter naming, no-std feature tiers, method-local generic bounds, feature-gated optional trait impls grouped in an anonymous const block, serde representation rules). Use when writing or reviewing any struct/enum definition, getter, builder, setter, or error type in a Rust library.
 ---
 
 # Rust type-declaration golden rules
@@ -388,49 +388,83 @@ str` discriminator** (`MissingField("name")` — the string IS the structured
 data: which field) and **a `String` blob explaining what went wrong** (`Failed("name was empty")` — the structure is lost). The first is fine; the
 second is the anti-pattern.
 
-### Last-resort escape hatch — `Other(...)` only when modelling is genuinely unreasonable
+### Foreign errors — typed wrap via `#[from]`, never `Box<dyn Error>`
 
-Some failures can't be modelled cleanly: wrapping a foreign error whose type
-shouldn't bleed into the API, a transient infrastructure detail, an
-upstream-vague condition. For those — and **only** those — keep ONE escape
-hatch as the last variant. Pick the form that matches what you're carrying:
+When a library function calls into another crate's API that returns a typed
+error, wrap that error as **its own named variant** via `#[from]`:
+
+```rust
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum FooError {
+    #[error("parse failed: {0}")]
+    Parse(#[from] serde_json::Error),
+
+    #[error("io failed: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("upstream service: {0}")]
+    Upstream(#[from] UpstreamError),
+}
+```
+
+`#[from]` gives you a free `From<serde_json::Error> for FooError` plus
+correct `source()` chaining, and the type chain is preserved end-to-end —
+callers can downcast, pattern-match on which foreign failure occurred, and
+write recovery code for specific upstream errors. **This is the only library
+pattern for foreign errors.** Do not box them.
+
+If a single foreign type produces multiple distinguishable failures you care
+about (e.g. `io::Error`'s `NotFound` vs `PermissionDenied` matter to your
+callers), split them into multiple variants of your own enum and convert
+explicitly — `#[from]` covers the common single-variant case; the manual
+conversion handles the cases where you need finer dispatch.
+
+### Last-resort escape hatch — `Other(Cow<'static, str>)` for unmappable descriptive text
+
+Some failures genuinely can't be modelled — a vague upstream condition that
+isn't a typed error, a transient infrastructure detail with no useful
+structure, ad-hoc context. For those keep ONE escape hatch as the last
+variant:
 
 ```rust
 #[non_exhaustive]
 pub enum FooError {
     /* …modelled variants… */
 
-    /// Pure descriptive text when there's nothing structured to carry.
+    /// Descriptive text for genuinely unmodellable cases. Used sparingly.
     #[error("{0}")]
     Other(Cow<'static, str>),
 }
 ```
 
-```rust
-#[non_exhaustive]
-pub enum FooError {
-    /* …modelled variants… */
-
-    /// Wrapped foreign error whose type isn't worth threading through the API.
-    #[error(transparent)]
-    Other(Box<dyn core::error::Error + Send + Sync + 'static>),
-}
-```
-
-- **`Cow<'static, str>`** when the payload is pure descriptive text. `Cow`
-  lets callers pass a `&'static str` (the common case, zero allocation) or an
-  owned `String` (a `format!(...)`) without forcing all call-sites to
-  allocate. Strictly more general than `String`; use it as the default.
-- **`Box<dyn core::error::Error + Send + Sync + 'static>`** when you're
-  wrapping an opaque foreign error. `Send + Sync` because errors cross
-  threads (tokio, rayon, channels). `'static` because no borrows in the box.
-  (`core::error::Error`, not `std::error::Error`, so the variant stays
-  no-std compatible.)
+`Cow<'static, str>` lets callers pass a `&'static str` (the common case,
+zero allocation) or an owned `String` (a `format!(...)`) without forcing all
+call-sites to allocate. Strictly more general than `String`; use it as the
+default text-payload form.
 
 Use `Other(_)` **sparingly**. Every time a real-world failure routes through
-it, that's a candidate for a structured variant — callers gain better
-dispatch and better error messages. Treat `Other` as the relief valve, not
-the default destination; review it on every PR that adds an error path.
+it, that's a candidate for promotion to a structured variant (or a typed
+`#[from]` wrap if it's a foreign error) — callers gain dispatch and better
+messages. Treat `Other` as the relief valve, not the default destination;
+review it on every PR that adds an error path.
+
+### `Box<dyn Error>` — binary applications only
+
+`Other(Box<dyn core::error::Error + Send + Sync + 'static>)` (or `anyhow::Error`,
+which boxes underneath) belongs in **end-of-the-line binaries** — CLIs,
+daemons, examples, integration tests — where the program is the final consumer
+of every error and just needs to bubble-and-report. Type erasure is fine
+there because nothing downstream needs to dispatch.
+
+It does **NOT** belong in a library's public error enum. A library that boxes
+its sources forces every caller into the same type-erased, dispatch-poor
+world; we can't pattern-match across a `dyn Error`, we can't write recovery
+code keyed on the underlying type, and `source()` walking has to downcast at
+every step. Use `#[from] *Error` instead.
+
+(`Send + Sync` because errors cross threads; `'static` because no borrows;
+`core::error::Error` (not `std::error::Error`) to stay no-std compatible.)
 
 ---
 
@@ -673,10 +707,14 @@ then fails to deserialize.
 - [ ] Errors derived (`thiserror`/equivalent), `#[non_exhaustive]`,
       `core::error::Error` for no-std.
 - [ ] Errors model the cause structurally — each failure is its own variant
-      with named fields, not a `String`/`&'static str` catch-all. Last-resort
-      escape hatch is `Other(Cow<'static, str>)` (descriptive text) or
-      `Other(Box<dyn core::error::Error + Send + Sync + 'static>)` (wrapped
-      foreign error), used sparingly.
+      with named fields, not a `String`/`&'static str` catch-all.
+- [ ] Foreign errors wrap as typed `#[from] *Error` variants (preserves
+      `source()` chain + caller dispatch), never `Other(Box<dyn Error>)`
+      in a library. `Box<dyn core::error::Error + Send + Sync + 'static>` /
+      `anyhow` belongs in binaries only.
+- [ ] Last-resort escape hatch is `Other(Cow<'static, str>)` for genuinely
+      unmodellable descriptive text, used sparingly (promote to a structured
+      variant when a recurring case shows up).
 - [ ] Generic parameters on `struct`/`enum`/inherent-`impl` carry no trait
       bounds — bounds live on the methods that use them via `where`.
       Exceptions: derived/structural trait impls (`impl<T: Clone> Clone for
