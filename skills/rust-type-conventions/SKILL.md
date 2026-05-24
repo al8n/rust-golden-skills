@@ -1,6 +1,6 @@
 ---
 name: rust-type-conventions
-description: Golden rules for declaring Rust structs, enums, and their accessors (encapsulation, const fn, new()/Default delegation, variant predicates, thiserror, structured error variants with #[from] for typed foreign-error wrapping and Cow<'static, str> for unmodellable text (Box<dyn Error>/anyhow only in binaries), open Other(_)/coded Unknown(n) enums, no-module-name-stutter naming, no-std feature tiers, method-local generic bounds, feature-gated optional trait impls grouped in an anonymous const block, serde representation rules). Use when writing or reviewing any struct/enum definition, getter, builder, setter, or error type in a Rust library.
+description: Golden rules for declaring Rust structs, enums, and their accessors (encapsulation, const fn, new()/Default delegation, variant predicates, mandatory `as_str` on unit-only enums, thiserror, structured error variants with #[from] for typed foreign-error wrapping and Cow<'static, str> for unmodellable text (Box<dyn Error>/anyhow only in binaries), open Other(_)/coded Unknown(n) enums, no-module-name-stutter naming, no-std feature tiers, method-local generic bounds, feature-gated optional trait impls grouped in an anonymous const block, serde representation rules). Use when writing or reviewing any struct/enum definition, getter, builder, setter, or error type in a Rust library.
 ---
 
 # Rust type-declaration golden rules
@@ -114,17 +114,56 @@ is flagged below.
   (Keeps each variant's data independently named, testable, and accessor-wrapped,
   and lets the `Unwrap`/`TryUnwrap` accessors hand back one coherent payload.)
 
-### Display = single source of truth
-Route `Display` through one `as_str`/`to_string`-style method so the two can't
-drift:
+### `as_str` — mandatory on every unit-only enum; Display routes through it
+
+Every unit-only enum **must** expose:
+
 ```rust
 impl Foo {
-    pub const fn as_str(&self) -> &'static str { /* match -> &'static str */ }
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::A => "a",
+            Self::B => "b",
+            // …
+        }
+    }
 }
-// then a manual Display, or #[display("{}", self.as_str())] with derive_more::Display
 ```
-`as_str` is `const fn -> &'static str` for unit-only enums; non-const `-> &str`
-for enums whose `Other`-style arm holds an owned string.
+
+Required regardless of whether the enum has a `Display` impl. The method gives you:
+
+- A **const-evaluable, allocation-free projection** to a stable string name — usable in `const` contexts, pattern-table builders, error messages, logging, wire-serialization tag bytes, schema-doc references, anywhere a variant needs a string handle.
+- **Single source of truth** for the variant's string name. When `Display`, serde tags, log keys, and schema-doc references all route through `as_str`, they can't drift from each other.
+- A **stable testing surface** — round-trip tests `from_str(x.as_str()) == x` are uniform across every enum that follows this rule.
+
+`Display` (when present) routes through `as_str`:
+
+```rust
+impl core::fmt::Display for Foo {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+// or with derive_more::Display:
+#[derive(derive_more::Display)]
+#[display("{}", self.as_str())]
+pub enum Foo { /* … */ }
+```
+
+**For enums with a data-carrying variant** (e.g. an `Other(String-ish)` arm), `as_str` is **non-const** and returns `-> &str`:
+
+```rust
+impl Foo {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::A => "a",
+            Self::Other(s) => s.as_str(),
+        }
+    }
+}
+```
+
+**Slug convention:** snake_case (`"variant_name"`, not `"VariantName"`) for serialization compatibility, unless the variant has a canonical external spelling (a MIME type, a language code, a hyphenated standard like `"cea_608"` vs `"CEA-608"` — pick the form the wire / spec uses) — then use that form. Pick a convention per enum and stick to it.
 
 ### Open vs coded vocabularies (be lossless)
 - **Open vocabulary** (names that may grow upstream — formats, codecs, kinds):
@@ -699,10 +738,13 @@ then fails to deserialize.
       ctors) are `#[inline(always)]` (or `#[cfg_attr(not(tarpaulin),
       inline(always))]` under a coverage tool).
 - [ ] Enums: variant predicates (+ unwrap accessors if data-carrying);
-      `#[non_exhaustive]`; `Display` via one `as_str`; open `Other(_)` /
-      coded `Unknown(n)` lossless escapes; variants only unit or newtype (no
-      struct `{…}` or multi-field tuple variants — extract to a named struct).
-      `Default` only if a variant is a genuine default
+      `#[non_exhaustive]`; **`pub const fn as_str(&self) -> &'static str`
+      mandatory on every unit-only enum** (`-> &str` non-const if the enum
+      has an `Other(String-ish)` arm); `Display` (when present) routes
+      through `as_str`; open `Other(_)` / coded `Unknown(n)` lossless
+      escapes; variants only unit or newtype (no struct `{…}` or
+      multi-field tuple variants — extract to a named struct). `Default`
+      only if a variant is a genuine default
       (`#[derive(Default)] + #[default]`).
 - [ ] Errors derived (`thiserror`/equivalent), `#[non_exhaustive]`,
       `core::error::Error` for no-std.
