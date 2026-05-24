@@ -191,11 +191,41 @@ pub enum Mode { #[default] Off, On }
 (A hand-written `impl Default` returning a variant is equivalent; prefer the
 derive unless the default needs a data-carrying variant.)
 
-### Variant-naming gotcha
-Auto-derived accessor names snake-case across digit boundaries: `Sd1080` →
-`is_sd_1080`, `NotV7` → `try_unwrap_not_v_7`. Rename for clean accessors
-(`WrongVersion` over `NotV7`; avoid digit-leading variants where the generated
-name reads badly).
+### Variant-naming gotcha — digit boundaries snake-case ugly
+
+Auto-derived accessor names snake-case across digit boundaries: `Sd1080`
+→ `is_sd_1080`, `Mp4` → `is_mp_4`, `M4a` → `is_m_4_a`, `NotV7` →
+`try_unwrap_not_v_7`. Two ways to fix the ugly name:
+
+**1. Rename the variant** when there's a natural longer name (`WrongVersion` over `NotV7`; avoid digit-leading variants where the generated name reads badly).
+
+**2. Skip the auto-derive + hand-write the predicate** when the variant name is a canonical external spelling that shouldn't change — codec / format / standard short names like `Mp4`, `Mp3`, `M4a`, `Mpl2`, `Cea608`, `H264`, `H265`, `Av1`, `Vp9`. Use derive_more's `(ignore)` attribute to skip the awkward auto-derive for just that variant, then write a clean hand-written replacement:
+
+```rust
+use derive_more::IsVariant;
+
+#[derive(IsVariant)]
+pub enum Format {
+    Mov,
+    /// MPEG-4 (`.mp4`). The auto-derived predicate would be
+    /// `is_mp_4` (digit-snake-case); the hand-written
+    /// [`Self::is_mp4`] below uses the cleaner name.
+    #[is_variant(ignore)]
+    Mp4,
+    Mkv,
+}
+
+impl Format {
+    /// True iff this is [`Self::Mp4`]. Hand-written to override the
+    /// auto-derived `is_mp_4` (digit-snake-case is ugly).
+    #[inline(always)]
+    pub const fn is_mp4(&self) -> bool { matches!(self, Self::Mp4) }
+}
+```
+
+The same `(ignore)` form works on the other derive_more derives — `#[unwrap(ignore)]` and `#[try_unwrap(ignore)]` (derive_more 2.0+) — when a data-carrying variant has the same digit-snake-case issue and you want a hand-written unwrap accessor instead. (Note: the attribute is `ignore`, not `skip`.)
+
+Pick **rename** when the variant is internal vocabulary; pick **`(ignore)` + hand-write** when the variant matches an external standard / industry name the world already knows.
 
 ---
 
