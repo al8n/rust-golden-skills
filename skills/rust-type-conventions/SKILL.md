@@ -136,19 +136,35 @@ Required regardless of whether the enum has a `Display` impl. The method gives y
 - **Single source of truth** for the variant's string name. When `Display`, serde tags, log keys, and schema-doc references all route through `as_str`, they can't drift from each other.
 - A **stable testing surface** — round-trip tests `from_str(x.as_str()) == x` are uniform across every enum that follows this rule.
 
-`Display` (when present) routes through `as_str`:
+`Display`, when present, **must be derived via `derive_more::Display` with `#[display("{}", self.as_str())]`** — not hand-written:
 
 ```rust
-impl core::fmt::Display for Foo {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(self.as_str())
+use derive_more::Display;
+
+#[derive(Display)]
+#[display("{}", self.as_str())]
+pub enum Foo {
+    A,
+    B,
+}
+
+impl Foo {
+    pub const fn as_str(&self) -> &'static str {
+        match self { Self::A => "a", Self::B => "b" }
     }
 }
-// or with derive_more::Display:
-#[derive(derive_more::Display)]
-#[display("{}", self.as_str())]
-pub enum Foo { /* … */ }
 ```
+
+Why mandate the derive over the hand-written `impl Display`:
+
+- **One source of truth, mechanically enforced.** The derive expands to exactly `f.write_str(self.as_str())`; there's no room for a contributor to write `write!(f, "{}", self.as_str())` (allocates a temporary buffer in some formatters) or to forget that Display should not add quotes / prefixes.
+- **No boilerplate.** Eliminates the 5-line `impl core::fmt::Display { fn fmt(...) }` from every enum that has `as_str`.
+- **`#[inline]` is implicit** in the derive output — you don't have to remember to add it.
+- **Diff visibility** when `as_str` changes — the derive references it directly; reviewers can see at the enum's attribute line that Display routes through `as_str`, without having to scan for the matching `impl Display` block later in the file.
+
+**Do not** write `impl core::fmt::Display for Foo { ... f.write_str(self.as_str()) }` by hand when the enum has an `as_str` method. The hand-written form is correct but redundant given the derive_more option; a reviewer should treat it as a smell.
+
+The same rule extends to other formatting traits that the derive supports — `Debug`, `LowerHex`, etc. — when they would similarly delegate to `as_str` or another single source of truth.
 
 **For enums with a data-carrying variant** (e.g. an `Other(String-ish)` arm), `as_str` is **non-const** and returns `-> &str`:
 
@@ -770,12 +786,13 @@ then fails to deserialize.
 - [ ] Enums: variant predicates (+ unwrap accessors if data-carrying);
       `#[non_exhaustive]`; **`pub const fn as_str(&self) -> &'static str`
       mandatory on every unit-only enum** (`-> &str` non-const if the enum
-      has an `Other(String-ish)` arm); `Display` (when present) routes
-      through `as_str`; open `Other(_)` / coded `Unknown(n)` lossless
-      escapes; variants only unit or newtype (no struct `{…}` or
-      multi-field tuple variants — extract to a named struct). `Default`
-      only if a variant is a genuine default
-      (`#[derive(Default)] + #[default]`).
+      has an `Other(String-ish)` arm); **when `as_str` exists, `Display`
+      uses `#[derive(derive_more::Display)] + #[display("{}",
+      self.as_str())]`** — never a hand-written `impl Display`; open
+      `Other(_)` / coded `Unknown(n)` lossless escapes; variants only
+      unit or newtype (no struct `{…}` or multi-field tuple variants —
+      extract to a named struct). `Default` only if a variant is a
+      genuine default (`#[derive(Default)] + #[default]`).
 - [ ] Errors derived (`thiserror`/equivalent), `#[non_exhaustive]`,
       `core::error::Error` for no-std.
 - [ ] Errors model the cause structurally — each failure is its own variant
