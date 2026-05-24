@@ -1,6 +1,6 @@
 ---
 name: rust-type-conventions
-description: Golden rules for declaring Rust structs, enums, and their accessors (encapsulation, const fn, new()/Default delegation, variant predicates, thiserror, open Other(_)/coded Unknown(n) enums, no-module-name-stutter naming, no-std feature tiers). Use when writing or reviewing any struct/enum definition, getter, builder, setter, or error type in a Rust library.
+description: Golden rules for declaring Rust structs, enums, and their accessors (encapsulation, const fn, new()/Default delegation, variant predicates, thiserror, open Other(_)/coded Unknown(n) enums, no-module-name-stutter naming, no-std feature tiers, method-local generic bounds). Use when writing or reviewing any struct/enum definition, getter, builder, setter, or error type in a Rust library.
 ---
 
 # Rust type-declaration golden rules
@@ -385,6 +385,76 @@ Verify across the matrix: `cargo hack test --each-feature` (or
 
 ---
 
+## 8. Generic bounds — on the methods that need them, not on the type
+
+A generic parameter declared on a `struct`/`enum`/`impl` block should carry
+**no trait bounds**. Move every bound to the specific method that actually
+requires it, via a `where` clause.
+
+### Bad
+```rust
+struct Foo<A: Clone> { /* … */ }
+
+impl<A: Clone> Foo<A> {
+    fn read(&self) -> &A { /* doesn't need Clone */ }
+    fn duplicate(&self) -> A { self.a.clone() }
+}
+```
+
+### Good
+```rust
+struct Foo<A> { /* … */ }
+
+impl<A> Foo<A> {
+    fn read(&self) -> &A { &self.a }                          // no bound
+    fn duplicate(&self) -> A where A: Clone { self.a.clone() } // bound where used
+}
+```
+
+### Why
+- **Composability.** `Foo<NonClone>` is a legal type. With the bound on the
+  struct, every downstream `Vec<Foo<T>>`, every blanket impl, every
+  `PhantomData` hop has to thread `T: Clone` even when no `Clone` method is
+  ever called. Method-local bounds keep the type usable in every context that
+  doesn't touch the constrained operation.
+- **Standard-library precedent.** `Vec<T>`, `HashMap<K, V>`, `BTreeSet<T>` —
+  none put bounds on the `struct`. `Vec<T>` doesn't require `T: Clone`; only
+  `.to_vec()` / `.extend_from_slice(...)` add `where T: Clone`. `HashMap<K, V>`
+  doesn't require `K: Hash + Eq` on the type — only the methods that actually
+  hash carry it.
+- **Smaller error spans.** A struct-level bound surfaces "T does not implement
+  Clone" at every construction site. A method-local bound surfaces it only at
+  the actual call site, where the user can see which capability they asked
+  for.
+- **Future flexibility.** Adding a method that needs a stronger bound is a
+  local change. Loosening a bound that's currently on the struct is a
+  breaking change for every consumer.
+
+### Exceptions (rare, document each)
+- **Derived trait impls.** `#[derive(Clone)]` on `Foo<T>` is correct — the
+  derive emits `impl<T: Clone> Clone for Foo<T>`, which is exactly the
+  pattern this rule promotes (bound on the impl that needs it, not on the
+  struct). Don't strip the derive trying to satisfy the rule.
+- **Trait impls where the bound is structural to the impl** — e.g.
+  `impl<T: Clone> Clone for Foo<T>`, `impl<T: Hash> Hash for Foo<T>`. The
+  bound is on the impl, not on the struct, and is mandated by what's being
+  implemented.
+- **Bounds that gate storage shape.** A type that genuinely cannot exist
+  without the bound (e.g. a phantom marker requiring `T: 'static` because the
+  type stores a `&'static T`; a sealed-trait newtype intentionally restricted
+  to a finite set). Real, rare, always with a comment.
+
+### Inherent `impl` blocks too
+The same rule applies to inherent `impl` blocks: prefer `impl<T> Foo<T>` with
+method-level `where` clauses over `impl<T: Trait> Foo<T>`. A single inherent
+`impl` block carrying a struct-wide bound is the same anti-pattern as the
+struct-level bound — every method in that block silently inherits the
+constraint. Either split into multiple `impl` blocks (one unconstrained, one
+constrained for the specific cluster of methods that need it) or — preferably
+— attach the bound directly to each method via `where`.
+
+---
+
 ## Review checklist (run against any struct/enum diff)
 
 - [ ] No public fields.
@@ -421,6 +491,10 @@ Verify across the matrix: `cargo hack test --each-feature` (or
       (`#[derive(Default)] + #[default]`).
 - [ ] Errors derived (`thiserror`/equivalent), `#[non_exhaustive]`,
       `core::error::Error` for no-std.
+- [ ] Generic parameters on `struct`/`enum`/inherent-`impl` carry no trait
+      bounds — bounds live on the methods that use them via `where`.
+      Exceptions: derived/structural trait impls (`impl<T: Clone> Clone for
+      Foo<T>`), documented storage-shape bounds.
 - [ ] No module-name stutter; bare names don't shadow std.
 - [ ] Test matrix + fmt + clippy clean; out-of-tree name references updated if
       anything was renamed.
