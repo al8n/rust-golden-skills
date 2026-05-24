@@ -650,14 +650,46 @@ impl<A> Foo<A> {
   type stores a `&'static T`; a sealed-trait newtype intentionally restricted
   to a finite set). Real, rare, always with a comment.
 
-### Inherent `impl` blocks too
-The same rule applies to inherent `impl` blocks: prefer `impl<T> Foo<T>` with
-method-level `where` clauses over `impl<T: Trait> Foo<T>`. A single inherent
-`impl` block carrying a struct-wide bound is the same anti-pattern as the
-struct-level bound — every method in that block silently inherits the
-constraint. Either split into multiple `impl` blocks (one unconstrained, one
-constrained for the specific cluster of methods that need it) or — preferably
-— attach the bound directly to each method via `where`.
+### Inherent `impl` blocks — group by shared bound
+
+Where the bound goes inside an inherent `impl` depends on how many methods need it:
+
+- **Bound used by ONE method only** → method-level `where` clause:
+
+  ```rust
+  impl<A> Foo<A> {
+      fn read(&self) -> &A { &self.a }
+      fn duplicate(&self) -> A where A: Clone { self.a.clone() }
+  }
+  ```
+
+- **Bound shared by MULTIPLE methods** → split into a dedicated `impl` block whose `where` clause carries it once:
+
+  ```rust
+  impl<A> Foo<A> {
+      fn read(&self) -> &A { &self.a }
+  }
+
+  impl<A> Foo<A> where A: Clone {
+      fn duplicate(&self) -> A { self.a.clone() }
+      fn replicate(&self) -> (A, A) { (self.a.clone(), self.a.clone()) }
+  }
+  ```
+
+Don't repeat the same `where A: Clone` on every method — that's the struct-level anti-pattern at one level removed (every duplicated clause is a maintenance liability when the bound changes, and a reviewer can't see at a glance which methods share the same constraint).
+
+Don't lump everything into one bounded `impl<A> Foo<A> where A: Clone { ... }` either — methods that don't actually need `Clone` would then silently inherit it, and callers using `Foo<NonClone>` would lose access to them. Split: unconstrained methods in an unconstrained `impl`, each shared-bound cluster in its own dedicated `impl` block.
+
+The struct itself stays unconstrained (no `<A: Clone>` on the type declaration); only `impl` blocks and individual methods carry bounds. The shape is:
+
+```rust
+struct Foo<A> { /* no bounds */ }
+impl<A> Foo<A> { /* unconstrained methods */ }
+impl<A> Foo<A> where A: Clone { /* methods sharing the Clone bound */ }
+impl<A> Foo<A> where A: Hash + Eq { /* methods sharing the Hash+Eq bound */ }
+```
+
+Use the `where` form (`impl<A> Foo<A> where A: Trait`) over the inline form (`impl<A: Trait> Foo<A>`) — it scales cleanly to multiple bounds and aligns with the per-method `where` clauses used elsewhere.
 
 ---
 
@@ -804,10 +836,14 @@ then fails to deserialize.
 - [ ] Last-resort escape hatch is `Other(Cow<'static, str>)` for genuinely
       unmodellable descriptive text, used sparingly (promote to a structured
       variant when a recurring case shows up).
-- [ ] Generic parameters on `struct`/`enum`/inherent-`impl` carry no trait
-      bounds — bounds live on the methods that use them via `where`.
-      Exceptions: derived/structural trait impls (`impl<T: Clone> Clone for
-      Foo<T>`), documented storage-shape bounds.
+- [ ] Generic parameters on `struct`/`enum` carry no trait bounds. Inside
+      inherent `impl` blocks, group by shared bound: a bound used by
+      **one** method sits on that method's `where`; a bound shared by
+      **multiple** methods sits on a dedicated `impl<T> Foo<T> where T:
+      Trait { … }` block (use the `where` form, not `impl<T: Trait>`).
+      No bound is repeated method-by-method when it could live on the
+      block. Exceptions: derived/structural trait impls (`impl<T: Clone>
+      Clone for Foo<T>`), documented storage-shape bounds.
 - [ ] Optional (feature-gated) trait impls — `serde`/`buffa`/`arbitrary`/… —
       grouped in one gated `const _: () = { … };` block (single `#[cfg]` +
       `doc(cfg)`, private helpers/imports scoped inside), not scattered
