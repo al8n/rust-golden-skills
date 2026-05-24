@@ -1,6 +1,6 @@
 ---
 name: rust-type-conventions
-description: Golden rules for declaring Rust structs, enums, and their accessors (encapsulation, const fn, new()/Default delegation, variant predicates, thiserror, open Other(_)/coded Unknown(n) enums, no-module-name-stutter naming, no-std feature tiers, method-local generic bounds, feature-gated optional trait impls grouped in an anonymous const block, serde representation rules). Use when writing or reviewing any struct/enum definition, getter, builder, setter, or error type in a Rust library.
+description: Golden rules for declaring Rust structs, enums, and their accessors (encapsulation, const fn, new()/Default delegation, variant predicates, thiserror, structured error variants with Cow/Box<dyn Error> escape hatches, open Other(_)/coded Unknown(n) enums, no-module-name-stutter naming, no-std feature tiers, method-local generic bounds, feature-gated optional trait impls grouped in an anonymous const block, serde representation rules). Use when writing or reviewing any struct/enum definition, getter, builder, setter, or error type in a Rust library.
 ---
 
 # Rust type-declaration golden rules
@@ -345,6 +345,93 @@ Keep siblings consistent: if `from_u32` is `const`, `to_u32` should be too.
 - For **no-std** crates, use a derive/library that emits `core::error::Error`
   (e.g. `thiserror` v2 with `default-features = false`), never `std::error::Error`.
 
+### Model the error — don't stringify it
+
+Each distinct failure case is a **named variant with structured data**, not a
+stringified blob. The point of a typed error is that callers (and tests, and
+`match` arms, and recovery code) can dispatch on **what** went wrong; a
+`String` / `&'static str` payload throws that information away exactly when
+it's most useful.
+
+**Bad** — every cause collapses to opaque text; nothing matches on:
+```rust
+pub enum FooError {
+    Failed(String),
+    Custom(&'static str),
+    InvalidInput(String),
+}
+```
+
+**Good** — each cause is its own variant; the data the caller needs to
+recover, report, or test against rides on the variant, not in a format
+string:
+```rust
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum FooError {
+    #[error("name `{name}` rejected: {reason}")]
+    InvalidName { name: SmolStr, reason: NameRejection },
+
+    #[error("missing required field `{0}`")]
+    MissingField(&'static str),                                  // dispatch on field name
+
+    #[error("checksum mismatch: expected {expected:?}, got {got:?}")]
+    ChecksumMismatch { expected: [u8; 32], got: [u8; 32] },
+
+    #[error("upstream service: {source}")]
+    Upstream { #[from] source: UpstreamError },
+}
+```
+
+Note the difference between **a unit/newtype variant carrying a `&'static
+str` discriminator** (`MissingField("name")` — the string IS the structured
+data: which field) and **a `String` blob explaining what went wrong** (`Failed("name was empty")` — the structure is lost). The first is fine; the
+second is the anti-pattern.
+
+### Last-resort escape hatch — `Other(...)` only when modelling is genuinely unreasonable
+
+Some failures can't be modelled cleanly: wrapping a foreign error whose type
+shouldn't bleed into the API, a transient infrastructure detail, an
+upstream-vague condition. For those — and **only** those — keep ONE escape
+hatch as the last variant. Pick the form that matches what you're carrying:
+
+```rust
+#[non_exhaustive]
+pub enum FooError {
+    /* …modelled variants… */
+
+    /// Pure descriptive text when there's nothing structured to carry.
+    #[error("{0}")]
+    Other(Cow<'static, str>),
+}
+```
+
+```rust
+#[non_exhaustive]
+pub enum FooError {
+    /* …modelled variants… */
+
+    /// Wrapped foreign error whose type isn't worth threading through the API.
+    #[error(transparent)]
+    Other(Box<dyn core::error::Error + Send + Sync + 'static>),
+}
+```
+
+- **`Cow<'static, str>`** when the payload is pure descriptive text. `Cow`
+  lets callers pass a `&'static str` (the common case, zero allocation) or an
+  owned `String` (a `format!(...)`) without forcing all call-sites to
+  allocate. Strictly more general than `String`; use it as the default.
+- **`Box<dyn core::error::Error + Send + Sync + 'static>`** when you're
+  wrapping an opaque foreign error. `Send + Sync` because errors cross
+  threads (tokio, rayon, channels). `'static` because no borrows in the box.
+  (`core::error::Error`, not `std::error::Error`, so the variant stays
+  no-std compatible.)
+
+Use `Other(_)` **sparingly**. Every time a real-world failure routes through
+it, that's a candidate for a structured variant — callers gain better
+dispatch and better error messages. Treat `Other` as the relief valve, not
+the default destination; review it on every PR that adds an error path.
+
 ---
 
 ## 6. Naming — no module-name stutter
@@ -585,6 +672,11 @@ then fails to deserialize.
       (`#[derive(Default)] + #[default]`).
 - [ ] Errors derived (`thiserror`/equivalent), `#[non_exhaustive]`,
       `core::error::Error` for no-std.
+- [ ] Errors model the cause structurally — each failure is its own variant
+      with named fields, not a `String`/`&'static str` catch-all. Last-resort
+      escape hatch is `Other(Cow<'static, str>)` (descriptive text) or
+      `Other(Box<dyn core::error::Error + Send + Sync + 'static>)` (wrapped
+      foreign error), used sparingly.
 - [ ] Generic parameters on `struct`/`enum`/inherent-`impl` carry no trait
       bounds — bounds live on the methods that use them via `where`.
       Exceptions: derived/structural trait impls (`impl<T: Clone> Clone for
