@@ -36,6 +36,42 @@ is flagged below.
   Both refcounted options use atomic refcounts (need atomics); keep
   `Vec`/`String` if you must run on atomic-less targets.
 
+### Empty means absent — never `Option<Vec<T>>` / `Option<String>` / `Option<SmolStr>` / `Option<Bytes>`
+
+A growable collection or string already encodes "no value" as the empty container — `Vec::new()` / `String::new()` / `SmolStr::default()` / `Bytes::new()` are all valid "nothing here" states. Wrapping these in `Option` introduces a **second** "no value" state that carries no additional information and creates a normalization burden at every read site (`None` vs `Some(vec![])`, `None` vs `Some("")`).
+
+Use the bare type, use `.is_empty()` to detect absence:
+
+```rust
+// BAD
+pub struct Foo {
+    tags: Option<Vec<Tag>>,     // None vs Some(vec![]) — pick one
+    name: Option<String>,       // None vs Some("") — pick one
+    title: Option<SmolStr>,
+    data: Option<Bytes>,
+}
+
+// GOOD
+pub struct Foo {
+    tags: Vec<Tag>,             // empty = absent
+    name: String,               // "" = absent
+    title: SmolStr,
+    data: Bytes,
+}
+
+// Reading:
+if !foo.tags_slice().is_empty() { /* there are tags */ }
+if !foo.name().is_empty() { /* a name was set */ }
+```
+
+**Exceptions** (rare; document each):
+
+- **`Option<T: Copy>` where `Some(zero)` ≠ `None`.** Scalars with no natural empty state — `Option<u16>` for a measurement where `Some(0)` is "I measured zero" and `None` is "I didn't measure". Keep `Option`.
+- **Fixed-size arrays `[T; N]`** — no `.is_empty()`; if absence matters use `Option<[T; N]>`.
+- **Wire shapes that distinguish missing-field from empty.** Even there, mediaschema-style domain layers normalise both to "absent" (empty) and the Rust field stays unwrapped; the wire bridge handles the distinction at the boundary, not in the domain type.
+
+Pairs with §10 (serde): every empty-as-absent field gets `#[serde(skip_serializing_if = "<T>::is_empty")]` + `#[serde(default)]` so absence round-trips symmetrically through the wire form.
+
 ### Construction — one shape per type
 - **Validating** when invariants must hold — `try_new(...) -> Result<Self, Err>`:
   reject sentinel/nil ids, empty required fields, out-of-range numbers,
@@ -302,10 +338,7 @@ pub const fn foo_mut(&mut self) -> &mut Vec<u32>    { &mut self.foo }           
 (`as_slice` and `&mut self.foo` are `const`; `as_mut_slice` is `const` on recent
 toolchains.)
 
-For string fields, **empty means absent** — prefer a plain string with `""` as
-the absent value over `Option<String>`. Exception: use `Option<T>` when the
-zero/empty value is itself meaningful and must be distinct from absent
-(e.g. `Option<u16>` where `Some(0)` ≠ `None`).
+For string / `Vec<T>` / `Bytes` fields, **empty means absent** — never wrap in `Option`. See §1 "Empty means absent" for the rule and the (rare) exceptions.
 
 ### Mutable getters — for fields that accept in-place mutation
 If a field may be mutated in place (an owned collection a caller appends to, a
@@ -798,6 +831,10 @@ then fails to deserialize.
       `#[derive]`); no feature-gated `Default`.
 - [ ] Field types: owned (`Vec`/`String`) for mutable, cheap-clone shared
       (`Bytes`/`Arc<_>`) for immutable large/shared payloads.
+- [ ] **Empty means absent** — no `Option<Vec<T>>`, no `Option<String>`,
+      no `Option<SmolStr>`, no `Option<Bytes>`. Use the bare type +
+      `.is_empty()`. Exception: `Option<T: Copy>` (non-container scalar)
+      where `Some(zero)` ≠ `None`.
 - [ ] Getters project the wrapper, never expose it: `Option<T>`→`Option<&T>`,
       `Vec<T>`/`Box<[T]>`/`Arc<[T]>`→`&[T]`, `String`→`&str`, `Bytes`→`&[u8]`.
       `const` unless a non-const op forbids it.
