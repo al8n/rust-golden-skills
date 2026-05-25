@@ -506,6 +506,36 @@ str` discriminator** (`MissingField("name")` — the string IS the structured
 data: which field) and **a `String` blob explaining what went wrong** (`Failed("name was empty")` — the structure is lost). The first is fine; the
 second is the anti-pattern.
 
+### In error messages, use `{}` for types that have `Display`, never `{:?}`
+
+When a `#[error("…")]` format string interpolates a field, **use `{}` (Display) whenever the field's type implements `Display`** — `{:?}` (Debug) is for dev-only logging and shows the wrong form to the user.
+
+**Bad** (`SubtitleCueKind` implements Display via derive_more + `as_str`; Debug prints `Cea608`, Display prints the canonical slug `cea_608`):
+```rust
+#[error("subtitle cue kind {0:?} not yet implemented (issue #56)")]
+UnimplementedFormat(SubtitleCueKind),
+```
+
+**Good**:
+```rust
+#[error("subtitle cue kind `{0}` not yet implemented (issue #56)")]
+UnimplementedFormat(SubtitleCueKind),
+```
+
+Reasoning:
+- **Display is the canonical user-facing form.** It's what serde tags, log keys, wire codecs, schema-doc references all route through (per §2's mandatory `as_str` rule). Error messages should match.
+- **Debug is for dev introspection**, often verbose, often includes type-internal fields the user doesn't care about, and changes shape across Rust versions / derive_more updates. Putting it in error text leaks implementation detail.
+- **`{:?}` defeats the whole point** of providing `Display` — the format that was designed for the message slot.
+- **`Debug` is also more expensive** at runtime than `Display` for non-trivial types (recursive field formatting), so `{:?}` in a hot error path is wasted work.
+
+**Use `{:?}` ONLY when the type doesn't have `Display`** — typically opaque byte arrays / raw bag types:
+```rust
+#[error("checksum mismatch: expected {expected:?}, got {got:?}")]
+ChecksumMismatch { expected: [u8; 32], got: [u8; 32] },  // [u8; 32] has no Display impl
+```
+
+If you find yourself reaching for `{:?}` on a type you control, add `Display` to it first (via derive_more, per §2), then switch the error message to `{}`. Hand-quote with backticks (`` `{0}` ``) if you want the value visually framed inside the message.
+
 ### Foreign errors — typed wrap via `#[from]`, never `Box<dyn Error>`
 
 When a library function calls into another crate's API that returns a typed
@@ -866,6 +896,11 @@ then fails to deserialize.
       `core::error::Error` for no-std.
 - [ ] Errors model the cause structurally — each failure is its own variant
       with named fields, not a `String`/`&'static str` catch-all.
+- [ ] In `#[error("…")]` format strings, fields whose type implements
+      `Display` use `{}` (not `{:?}`). `{:?}` is reserved for opaque types
+      with no `Display` impl (e.g. `[u8; 32]` byte arrays). If you reach
+      for `{:?}` on a type you control, add `Display` (via derive_more
+      per §2) first.
 - [ ] Foreign errors wrap as typed `#[from] *Error` variants (preserves
       `source()` chain + caller dispatch), never `Other(Box<dyn Error>)`
       in a library. `Box<dyn core::error::Error + Send + Sync + 'static>` /
