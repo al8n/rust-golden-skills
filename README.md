@@ -11,6 +11,7 @@ review feedback on every PR.
 | Skill | What it covers |
 |-------|----------------|
 | [`rust-type-conventions`](skills/rust-type-conventions/SKILL.md) | Declaring structs, enums, and their accessors: encapsulation, `const fn`, opt-in `new()`/`Default` (delegate, don't re-derive), getter projection (`Option<&T>` / `&[T]` / `&str`), the `set_`/`with_`/`update_`/`maybe_`/`clear_` mutator vocabulary for `Option<T>`/`bool` fields, `#[must_use]` on consuming builders, `#[inline(always)]` on cheap accessors, `thiserror` errors, open `Other(_)` / coded `Unknown(n)` enums, no-module-name-stutter naming, and no-std feature tiers. |
+| [`codex-adversarial-loop`](skills/codex-adversarial-loop/SKILL.md) | **Workflow skill** for driving a Codex adversarial-review iteration loop against a Rust branch/PR before opening it on GitHub: dispatch shape (`codex-companion.mjs adversarial-review --base ref --wait <prompt>`), the cargo pre-flight verify gates (`fmt` + `clippy --all-features --tests -D warnings` + `cargo doc -D warnings` + `cargo hack --each-feature`, with `PIPESTATUS` / `; var=$?` discipline for exit codes), the focused-prompt template (foreground correctness/safety/UB, end with scope fence, no shell metachars), iterate-with-amend-and-force-with-lease, the 6-round CAP escalation rule (spiral vs iteration), and the 8 anti-patterns each cross-linked to a known-defect rationale. |
 
 ## Layout
 
